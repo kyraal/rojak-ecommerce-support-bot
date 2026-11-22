@@ -1,7 +1,5 @@
 import io
-import os
-import shutil
-import subprocess
+import hashlib
 from pathlib import Path
 
 import pandas as pd
@@ -30,72 +28,16 @@ def build_assistant(df):
     return ReviewAssistant(df)
 
 
-def find_ffmpeg():
-    """Find FFmpeg without relying on ffprobe."""
-    candidates = [
-        shutil.which("ffmpeg"),
-        "/opt/homebrew/bin/ffmpeg",  # Apple Silicon Homebrew
-        "/usr/local/bin/ffmpeg",    # Intel Homebrew
-    ]
-    for candidate in candidates:
-        if candidate and Path(candidate).is_file():
-            return candidate
-    return None
-
-
-def convert_to_pcm_wav(audio_bytes):
-    """
-    Return PCM WAV bytes.
-    First try the recording as-is (mic_recorder may already return WAV).
-    If it is another browser format, convert it with FFmpeg.
-    """
-    try:
-        with sr.AudioFile(io.BytesIO(audio_bytes)):
-            # Successfully opening it means SpeechRecognition can read this format.
-            return audio_bytes
-    except (ValueError, OSError):
-        pass
-
-    ffmpeg = find_ffmpeg()
-    if not ffmpeg:
-        raise RuntimeError(
-            "This recording is not a PCM WAV file and FFmpeg is not installed. "
-            "Install it with `brew install ffmpeg`, then restart Streamlit."
-        )
-
-    command = [
-        ffmpeg,
-        "-hide_banner",
-        "-loglevel", "error",
-        "-i", "pipe:0",
-        "-f", "wav",
-        "-acodec", "pcm_s16le",
-        "-ar", "16000",
-        "-ac", "1",
-        "pipe:1",
-    ]
-    result = subprocess.run(
-        command,
-        input=audio_bytes,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
-    if result.returncode != 0 or not result.stdout:
-        detail = result.stderr.decode("utf-8", errors="replace").strip()
-        raise RuntimeError(
-            "Could not convert the microphone recording. "
-            + (detail or "FFmpeg returned no audio.")
-        )
-    return result.stdout
-
-
 def transcribe_recording(audio_bytes, language):
-    wav_bytes = convert_to_pcm_wav(audio_bytes)
     recognizer = sr.Recognizer()
-    with sr.AudioFile(io.BytesIO(wav_bytes)) as source:
+
+    with sr.AudioFile(io.BytesIO(audio_bytes)) as source:
         recorded = recognizer.record(source)
-    return recognizer.recognize_google(recorded, language=language)
+
+    return recognizer.recognize_google(
+        recorded,
+        language=language
+    )
 
 
 st.markdown(
@@ -268,71 +210,66 @@ if page == "Product & Chat":
             )
             st.rerun()
 
-        st.divider()
-        st.markdown("**Voice input (speech-to-text)**")
-        st.caption(
-            "Record a question, review the transcript, then send it to the chatbot. "
-            "Speech recognition requires an internet connection and may not perfectly "
-            "transcribe English–BM code-switching."
+        
+st.divider()
+st.markdown("**🎙️ Voice input (speech-to-text)**")
+st.caption(
+    "Record your question, check the transcript, "
+    "then send it to Rojak."
+)
+
+voice_language = st.selectbox(
+    "Speech language",
+    ["ms-MY", "en-US"],
+    format_func=lambda x: (
+        "Bahasa Melayu" if x == "ms-MY" else "English"
+    ),
+    key="voice_language",
+)
+
+audio = st.audio_input(
+    "Record your question",
+    sample_rate=16000,
+    key="voice_input",
+)
+
+if audio is not None:
+    audio_bytes = audio.getvalue()
+    audio_hash = hashlib.sha256(audio_bytes).hexdigest()
+
+    if audio_hash != st.session_state.last_audio_hash:
+        st.session_state.last_audio_hash = audio_hash
+
+        with st.spinner("Transcribing your question..."):
+            try:
+                st.session_state.voice_transcript = (
+                    transcribe_recording(
+                        audio_bytes,
+                        voice_language
+                    )
+                )
+            except sr.UnknownValueError:
+                st.warning(
+                    "Sorry, I couldn't understand that. "
+                    "Please try again."
+                )
+            except sr.RequestError as exc:
+                st.error(f"Google speech recognition error: {exc}")
+            except Exception as exc:
+                st.error(f"Audio error: {exc}")
+
+if st.session_state.voice_transcript:
+    st.success(
+        f"Recognised: {st.session_state.voice_transcript}"
+    )
+
+    if st.button("Send recognised question", type="primary"):
+        st.session_state.pending_question = (
+            st.session_state.voice_transcript
         )
+        st.session_state.voice_transcript = ""
+        st.rerun()
 
-        voice_language = st.selectbox(
-            "Speech recognition language",
-            options=["ms-MY", "en-MY"],
-            format_func=lambda value: (
-                "Bahasa Melayu (may handle some mixed speech)" if value == "ms-MY"
-                else "English (Malaysia)"
-            ),
-            key="voice_language",
-        )
-
-        try:
-            from streamlit_mic_recorder import mic_recorder
-
-            audio = mic_recorder(
-                start_prompt="🎙️ Record question",
-                stop_prompt="⏹️ Stop recording",
-                key="voice_input",
-                use_container_width=False,
-            )
-
-            if audio and audio.get("bytes"):
-                import hashlib
-
-                audio_bytes = audio["bytes"]
-                audio_hash = hashlib.sha256(audio_bytes).hexdigest()
-
-                if audio_hash != st.session_state.last_audio_hash:
-                    st.session_state.last_audio_hash = audio_hash
-                    st.session_state.voice_transcript = ""
-
-                    with st.spinner("Transcribing your recording..."):
-                        try:
-                            st.session_state.voice_transcript = transcribe_recording(
-                                audio_bytes, voice_language
-                            )
-                        except sr.UnknownValueError:
-                            st.warning(
-                                "I couldn't understand the recording. "
-                                "Please try again or type your question."
-                            )
-                        except sr.RequestError as exc:
-                            st.error(f"Speech recognition service error: {exc}")
-                        except Exception as exc:
-                            st.error(f"Audio processing error: {exc}")
-
-            if st.session_state.voice_transcript:
-                st.success(f"Recognised: {st.session_state.voice_transcript}")
-                if st.button("Send recognised question", type="primary"):
-                    st.session_state.pending_question = st.session_state.voice_transcript
-                    st.session_state.voice_transcript = ""
-                    st.rerun()
-
-        except ImportError:
-            st.info(
-                "Microphone support is optional. Install `streamlit-mic-recorder` "
-                "and `SpeechRecognition` from requirements.txt to enable it."
-            )
 
 
 elif page == "Review Insights":
